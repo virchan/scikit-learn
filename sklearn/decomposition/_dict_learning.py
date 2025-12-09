@@ -1343,6 +1343,13 @@ class SparseCoder(_BaseSparseCoding, BaseEstimator):
         self : object
             Returns the instance itself.
         """
+        X = validate_data(self, X)
+        self.n_components_ = self.dictionary.shape[0]
+        if X.shape[1] != self.dictionary.shape[1]:
+            raise ValueError(
+                "Dictionary and X have different numbers of features:"
+                f"dictionary.shape: {self.dictionary.shape} X.shape: {X.shape}"
+            )
         return self
 
     def transform(self, X, y=None):

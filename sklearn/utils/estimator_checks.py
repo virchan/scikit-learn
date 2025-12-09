@@ -198,9 +198,11 @@ def _yield_checks(estimator):
     yield check_estimators_pickle
     yield partial(check_estimators_pickle, readonly_memmap=True)
 
-    if tags.array_api_support:
-        for check in _yield_array_api_checks(estimator):
-            yield check
+    for check in _yield_array_api_checks(
+        estimator,
+        only_numpy=not tags.array_api_support,
+    ):
+        yield check
 
     yield check_f_contiguous_array_estimator
 
@@ -338,18 +340,30 @@ def _yield_outliers_checks(estimator):
     yield check_non_transformer_estimators_n_iter
 
 
-def _yield_array_api_checks(estimator):
-    for (
-        array_namespace,
-        device,
-        dtype_name,
-    ) in yield_namespace_device_dtype_combinations():
+def _yield_array_api_checks(estimator, only_numpy=False):
+    if only_numpy:
+        # Enabling array API dispatch and feeding the NumPy inputs should yield
+        # consistent results, even if estimator does not explicitly support
+        # array API.
         yield partial(
             check_array_api_input,
-            array_namespace=array_namespace,
-            dtype_name=dtype_name,
-            device=device,
+            array_namespace="numpy",
+            expect_only_array_outputs=False,
         )
+    else:
+        # These extended checks should pass for all estimators that declare
+        # array API support in their tags.
+        for (
+            array_namespace,
+            device,
+            dtype_name,
+        ) in yield_namespace_device_dtype_combinations():
+            yield partial(
+                check_array_api_input,
+                array_namespace=array_namespace,
+                dtype_name=dtype_name,
+                device=device,
+            )
 
 
 def _yield_all_checks(estimator, legacy: bool):
@@ -1049,6 +1063,8 @@ def check_array_api_input(
     device=None,
     dtype_name="float64",
     check_values=False,
+    check_sample_weight=False,
+    expect_only_array_outputs=True,
 ):
     """Check that the estimator can work consistently with the Array API
 
@@ -1057,21 +1073,31 @@ def check_array_api_input(
 
     When check_values is True, it also checks that calling the estimator on the
     array_api Array gives the same results as ndarrays.
+
+    When sample_weight is True, dummy sample weights are passed to the fit call.
     """
     xp = _array_api_for_tests(array_namespace, device)
 
-    X, y = make_classification(random_state=42)
+    X, y = make_classification(n_samples=30, n_features=10, random_state=42)
     X = X.astype(dtype_name, copy=False)
 
     X = _enforce_estimator_tags_X(estimator_orig, X)
     y = _enforce_estimator_tags_y(estimator_orig, y)
 
     est = clone(estimator_orig)
+    set_random_state(est)
 
     X_xp = xp.asarray(X, device=device)
     y_xp = xp.asarray(y, device=device)
+    fit_kwargs = {}
+    fit_kwargs_xp = {}
+    if check_sample_weight:
+        fit_kwargs["sample_weight"] = np.ones(X.shape[0], dtype=X.dtype)
+        fit_kwargs_xp["sample_weight"] = xp.asarray(
+            fit_kwargs["sample_weight"], device=device
+        )
 
-    est.fit(X, y)
+    est.fit(X, y, **fit_kwargs)
 
     array_attributes = {
         key: value for key, value in vars(est).items() if isinstance(value, np.ndarray)
@@ -1079,7 +1105,7 @@ def check_array_api_input(
 
     est_xp = clone(est)
     with config_context(array_api_dispatch=True):
-        est_xp.fit(X_xp, y_xp)
+        est_xp.fit(X_xp, y_xp, **fit_kwargs_xp)
         input_ns = get_namespace(X_xp)[0].__name__
 
     # Fitted attributes which are arrays must have the same
@@ -1093,7 +1119,8 @@ def check_array_api_input(
             f"got {attribute_ns}"
         )
 
-        assert array_device(est_xp_param) == array_device(X_xp)
+        with config_context(array_api_dispatch=True):
+            assert array_device(est_xp_param) == array_device(X_xp)
 
         est_xp_param_np = _convert_to_numpy(est_xp_param, xp=xp)
         if check_values:
@@ -1105,7 +1132,11 @@ def check_array_api_input(
             )
         else:
             assert attribute.shape == est_xp_param_np.shape
-            assert attribute.dtype == est_xp_param_np.dtype
+            if device == "mps" and np.issubdtype(est_xp_param_np.dtype, np.floating):
+                # for mps devices the maximum supported floating dtype is float32
+                assert est_xp_param_np.dtype == np.float32
+            else:
+                assert est_xp_param_np.dtype == attribute.dtype
 
     # Check estimator methods, if supported, give the same results
     methods = (
@@ -1180,44 +1211,48 @@ def check_array_api_input(
             f"got {result_ns}."
         )
 
-        assert array_device(result_xp) == array_device(X_xp)
-        result_xp_np = _convert_to_numpy(result_xp, xp=xp)
+        if expect_only_array_outputs:
+            with config_context(array_api_dispatch=True):
+                assert array_device(result_xp) == array_device(X_xp)
 
-        if check_values:
-            assert_allclose(
-                result,
-                result_xp_np,
-                err_msg=f"{method} did not the return the same result",
-                atol=_atol_for_type(X.dtype),
-            )
-        else:
-            if hasattr(result, "shape"):
-                assert result.shape == result_xp_np.shape
-                assert result.dtype == result_xp_np.dtype
+            result_xp_np = _convert_to_numpy(result_xp, xp=xp)
+
+            if check_values:
+                assert_allclose(
+                    result,
+                    result_xp_np,
+                    err_msg=f"{method} did not the return the same result",
+                    atol=_atol_for_type(X.dtype),
+                )
+            else:
+                if hasattr(result, "shape"):
+                    assert result.shape == result_xp_np.shape
+                    assert result.dtype == result_xp_np.dtype
 
         if method_name == "transform" and hasattr(est, "inverse_transform"):
             inverse_result = est.inverse_transform(result)
             with config_context(array_api_dispatch=True):
-                invese_result_xp = est_xp.inverse_transform(result_xp)
-                inverse_result_ns = get_namespace(invese_result_xp)[0].__name__
+                inverse_result_xp = est_xp.inverse_transform(result_xp)
+                inverse_result_ns = get_namespace(inverse_result_xp)[0].__name__
             assert inverse_result_ns == input_ns, (
                 "'inverse_transform' output is in wrong namespace, expected"
                 f" {input_ns}, got {inverse_result_ns}."
             )
 
-            assert array_device(invese_result_xp) == array_device(X_xp)
+            with config_context(array_api_dispatch=True):
+                assert array_device(inverse_result_xp) == array_device(X_xp)
 
-            invese_result_xp_np = _convert_to_numpy(invese_result_xp, xp=xp)
+            inverse_result_xp_np = _convert_to_numpy(inverse_result_xp, xp=xp)
             if check_values:
                 assert_allclose(
                     inverse_result,
-                    invese_result_xp_np,
+                    inverse_result_xp_np,
                     err_msg="inverse_transform did not the return the same result",
                     atol=_atol_for_type(X.dtype),
                 )
             else:
-                assert inverse_result.shape == invese_result_xp_np.shape
-                assert inverse_result.dtype == invese_result_xp_np.dtype
+                assert inverse_result.shape == inverse_result_xp_np.shape
+                assert inverse_result.dtype == inverse_result_xp_np.dtype
 
 
 def check_array_api_input_and_values(
