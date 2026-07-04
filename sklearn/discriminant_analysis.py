@@ -9,6 +9,7 @@ from numbers import Integral, Real
 import numpy as np
 import scipy.linalg
 from scipy import linalg
+from scipy.sparse import csr_matrix
 
 from sklearn.base import (
     BaseEstimator,
@@ -118,13 +119,17 @@ def _class_means(X, y):
     if is_array_api_compliant:
         for i in range(classes.shape[0]):
             means[i, :] = xp.mean(X[y == i], axis=0)
+        return means
     else:
-        # TODO: Explore the choice of using bincount + add.at as it seems sub optimal
-        # from a performance-wise
-        cnt = np.bincount(y)
-        np.add.at(means, y, X)
-        means /= cnt[:, None]
-    return means
+        n_classes = int(y.max()) + 1
+        n_samples = y.shape[0]
+        class_indicator = csr_matrix(
+            (np.ones(n_samples, dtype=X.dtype), (np.arange(n_samples), y)),
+            shape=(n_samples, n_classes),
+        )
+        sums = class_indicator.T @ X
+        cnt = np.bincount(y, minlength=n_classes).astype(X.dtype, copy=False)
+        return sums / cnt[:, None]
 
 
 def _class_cov(X, y, priors, shrinkage=None, covariance_estimator=None):
