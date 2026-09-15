@@ -13,21 +13,21 @@ from numbers import Integral, Real
 import numpy as np
 from scipy.sparse import SparseEfficiencyWarning, issparse
 
-from ..base import BaseEstimator, ClusterMixin, _fit_context
-from ..exceptions import DataConversionWarning
-from ..metrics import pairwise_distances
-from ..metrics.pairwise import _VALID_METRICS, PAIRWISE_BOOLEAN_FUNCTIONS
-from ..neighbors import NearestNeighbors
-from ..utils import gen_batches
-from ..utils._chunking import get_chunk_n_rows
-from ..utils._param_validation import (
+from sklearn.base import BaseEstimator, ClusterMixin, _fit_context
+from sklearn.exceptions import DataConversionWarning
+from sklearn.metrics import pairwise_distances
+from sklearn.metrics.pairwise import _VALID_METRICS, PAIRWISE_BOOLEAN_FUNCTIONS
+from sklearn.neighbors import NearestNeighbors, sort_graph_by_row_values
+from sklearn.utils import gen_batches
+from sklearn.utils._chunking import get_chunk_n_rows
+from sklearn.utils._param_validation import (
     HasMethods,
     Interval,
     RealNotInt,
     StrOptions,
     validate_params,
 )
-from ..utils.validation import check_memory, validate_data
+from sklearn.utils.validation import check_memory, validate_data
 
 
 class OPTICS(ClusterMixin, BaseEstimator):
@@ -341,6 +341,8 @@ class OPTICS(ClusterMixin, BaseEstimator):
                 # Set each diagonal to an explicit value so each point is its
                 # own neighbor
                 X.setdiag(X.diagonal())
+            # Sorting could be undone by .setdiag(), make sure it's sorted
+            X = sort_graph_by_row_values(X, warn_when_not_sorted=False)
         memory = check_memory(self.memory)
 
         (
